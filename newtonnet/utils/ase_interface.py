@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from ase.units import *
 from ase.calculators.calculator import Calculator
@@ -18,7 +19,7 @@ class MLAseCalculator(Calculator):
     implemented_properties = ['energy', 'forces', 'hessian']
 
     ### Constructor ###
-    def __init__(self, model_path, settings_path, hess_method=None, hess_precision=None, disagreement='std', device='cpu', dtype='float', **kwargs):
+    def __init__(self, model_path=None, settings_path=None, hess_method=None, hess_precision=None, disagreement='std', device='cpu', dtype='float', **kwargs):
         """
         Constructor for MLAseCalculator
 
@@ -70,7 +71,13 @@ class MLAseCalculator(Calculator):
             self.dtype = torch.float
         elif dtype == 'double':
             self.dtype = torch.double
-        if type(model_path) is list:
+        if model_path == None:
+            self.models = [self.load_model(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model_state.tar"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+            )]
+            print("model_path is None, using default model path and settings path for Transition1x dataset")
+        elif type(model_path) is list:
             self.models = [self.load_model(model_path_, settings_path_) for model_path_, settings_path_ in zip(model_path, settings_path)]
         else:
             self.models = [self.load_model(model_path, settings_path)]
