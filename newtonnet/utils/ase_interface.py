@@ -19,7 +19,7 @@ class MLAseCalculator(Calculator):
     implemented_properties = ['energy', 'forces', 'hessian']
 
     ### Constructor ###
-    def __init__(self, model_path=None, settings_path=None, hess_method=None, hess_precision=None, disagreement='std', device='cpu', dtype='float', **kwargs):
+    def __init__(self, model_path=None, settings_path=None, hess_method=None, hess_precision=None, disagreement='std', device='cpu', dtype='float', h=1e-3, **kwargs):
         """
         Constructor for MLAseCalculator
 
@@ -59,6 +59,7 @@ class MLAseCalculator(Calculator):
         if self.hess_method == 'autograd':
             self.return_hessian = True
         elif self.hess_method == 'fwd_diff' or self.hess_method == 'cnt_diff':
+            raise NotImplementedError
             self.return_hessian = False
             self.hess_precision = hess_precision
         else:
@@ -81,85 +82,42 @@ class MLAseCalculator(Calculator):
             self.models = [self.load_model(model_path_, settings_path_) for model_path_, settings_path_ in zip(model_path, settings_path)]
         else:
             self.models = [self.load_model(model_path, settings_path)]
-        
 
-    def calculate(self, atoms=None, properties=['energy','forces','hessian'], system_changes=None):
+        self.ZEROTH_ORDER_H = h
+    
+    def add_perturbation(self, data, perturbation):
+        print('='*89)
+        print('len data', len(data))
+    
+        print(data)
+        print('shape of position', data.pos.shape, type(data.pos))
+        mean,std = 0.0,0.1 # mean of the Gaussian noise
+        noise = torch.normal(mean=torch.full(data.pos.shape, mean), 
+                            std=torch.full(data.pos.shape, std))
+
+        # Add the noise to the original tensor
+        data_perturb = data.clone()
+        data_perturb.pos = data.pos + noise
+        print(data)
+        print(data_perturb)
+
+    def calculate(self, atoms=None, properties=['energy','forces','hessian'], system_changes=None, random_perturb=False):
         super().calculate(atoms,properties,system_changes)
-        data = self.extensive_data_loader(data=self.data_formatter(atoms), device=self.device[0])
-        energy = np.zeros((len(self.models), 1))
-        forces = np.zeros((len(self.models), data['R'].shape[1], 3))
-        if self.hess_method is not None:
-            hessian = np.zeros((len(self.models), data['R'].shape[1], 3, data['R'].shape[1], 3))
-        else:
-            hessian = np.zeros((len(self.models), 1))
-        if self.hess_method=='autograd':
-            for model_, model in enumerate(self.models):
-                #pred_E = lambda R: self.model(dict(data, R=R))
-                #pred_F = torch.func.jacrev(pred_E)
-                #pred_H = torch.func.hessian(pred_E)
-                #energy = pred_E(data['R'])
-                #forces = -pred_F(data['R'])
-                #hessian = pred_H(data['R'])
-                #energy = self.model(data).detach().cpu().numpy()
-                #forces = -F.jacobian(lambda R: self.model(dict(data, R=R)), data['R']).detach().cpu().numpy()
-                #hessian = F.hessian(lambda R: self.model(dict(data, R=R), vectorize=True), data['R']).detach().cpu().numpy()
-                pred = model(data)
-                energy[model_] = pred['E'].detach().cpu().numpy() * (kcal/mol)
-                forces[model_] = pred['F'].detach().cpu().numpy() * (kcal/mol/Ang)
-                hessian[model_] = pred['H'].detach().cpu().numpy() * (kcal/mol/Ang/Ang)
-                del pred
-        elif self.hess_method=='fwd_diff':
-            for model_, model in enumerate(self.models):
-                pred = model(data)
-                energy[model_] = pred['E'].detach().cpu().numpy()[0] * (kcal/mol)
-                forces_temp = pred['F'].detach().cpu().numpy() * (kcal/mol/Ang)
-                forces[model_] = forces_temp[0]
-                n = 1
-                for A_ in range(data['R'].shape[1]):
-                    for X_ in range(3):
-                        hessian[model_, A_, X_, :, :] = -(forces_temp[n] - forces_temp[0]) / self.hess_precision
-                        n += 1
-                del pred
-        elif self.hess_method=='cnt_diff':
-            for model_, model in enumerate(self.models):
-                pred = model(data)
-                energy[model_] = pred['E'].detach().cpu().numpy()[0] * (kcal/mol)
-                forces_temp = pred['F'].detach().cpu().numpy() * (kcal/mol/Ang)
-                forces[model_] = forces_temp[0]
-                n = 1
-                for A_ in range(data['R'].shape[1]):
-                    for X_ in range(3):
-                        hessian[model_, A_, X_, :, :] = -(forces_temp[n] - forces_temp[n+1]) / 2 / self.hess_precision
-                        n += 2
-                del pred
-        elif self.hess_method is None:
-            for model_, model in enumerate(self.models):
-                pred = model(data)
-                energy[model_] = pred['E'].detach().cpu().numpy()[0] * (kcal/mol)
-                forces[model_] = pred['F'].detach().cpu().numpy()[0] * (kcal/mol/Ang)
-                del pred
-        self.results['outlier'] = self.q_test(energy)
-        self.results['energy'] = self.remove_outlier(energy, self.results['outlier']).mean()
-        self.results['forces'] = self.remove_outlier(forces, self.results['outlier']).mean(axis=0)
-        self.results['hessian'] = self.remove_outlier(hessian, self.results['outlier']).mean(axis=0)
-        if self.disagreement=='std':
-            self.results['energy_disagreement'] = energy.std()
-            self.results['forces_disagreement'] = forces.std(axis=0).max()
-            self.results['hessian_disagreement'] = hessian.std(axis=0).max()
-        elif self.disagreement=='std_outlierremoval':
-            self.results['energy_disagreement'] = self.remove_outlier(energy, self.results['outlier']).std()
-            self.results['forces_disagreement'] = self.remove_outlier(forces, self.results['outlier']).std(axis=0).max()
-            self.results['hessian_disagreement'] = self.remove_outlier(hessian, self.results['outlier']).std(axis=0).max()
-        elif self.disagreement=='range':
-            self.results['energy_disagreement'] = (energy.max() - energy.min())
-            self.results['forces_disagreement'] = (forces.max(axis=0) - forces.min(axis=0)).max()
-            self.results['hessian_disagreement'] = (hessian.max(axis=0) - hessian.min(axis=0)).max()
-        elif self.disagreement=='values':
-            self.results['energy_disagreement'] = energy
-            self.results['forces_disagreement'] = forces
-            self.results['hessian_disagreement'] = hessian
-        del energy, forces, hessian
-
+        if random_perturb:
+            data, _p = self.data_formatter(atoms, random_perturb)
+        else: 
+            data = self.data_formatter(atoms)
+        data_ = self.extensive_data_loader(data=data, device=self.device[0])
+        pred = self.models[0](data_)
+        self.results['energy'] = pred['E'].squeeze(0).detach().cpu().numpy() * (kcal/mol)
+        if "forces" in properties:
+            self.results['forces'] = pred['F'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang)
+        if "hessian" in properties:
+            self.results['hessian'] = pred['H'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang/Ang)
+        if random_perturb:
+            self.results['perturb'] = _p
+        
+        del pred
 
     def load_model(self, model_path, settings_path):
         settings = yaml.safe_load(open(settings_path, "r"))
@@ -190,7 +148,7 @@ class MLAseCalculator(Calculator):
         return model
     
 
-    def data_formatter(self, atoms):
+    def data_formatter(self, atoms, random_perturb = False):
         """
         convert ase.Atoms to input format of the model
 
@@ -213,31 +171,12 @@ class MLAseCalculator(Calculator):
             'E': np.zeros((1,1)), #shape(ndata,1)
             'F': np.zeros((1,len(atoms.get_atomic_numbers()), 3)),#shape(ndata,natoms,3)
         }
-        if self.hess_method=='fwd_diff':
-            n = data['R'].size
-            data['R'] = np.tile(data['R'], (1 + n, 1, 1))
-            data['Z'] = np.tile(data['Z'], (1 + n, 1))
-            data['E'] = np.tile(data['E'], (1 + n, 1))
-            data['F'] = np.tile(data['F'], (1 + n, 1, 1))
-            n = 1
-            for A_ in range(data['R'].shape[1]):
-                for X_ in range(3):
-                    data['R'][n, A_, X_] += self.hess_precision
-                    n += 1
-        if self.hess_method=='cnt_diff':
-            n = data['R'].size
-            data['R'] = np.tile(data['R'], (1 + 2*n, 1, 1))
-            data['Z'] = np.tile(data['Z'], (1 + 2*n, 1))
-            data['E'] = np.tile(data['E'], (1 + 2*n, 1))
-            data['F'] = np.tile(data['F'], (1 + 2*n, 1, 1))
-            n = 1
-            for A_ in range(data['R'].shape[1]):
-                for X_ in range(3):
-                    data['R'][n, A_, X_] += self.hess_precision
-                    data['R'][n+1, A_, X_] -= self.hess_precision
-                    n += 2
-        return data
-
+        if random_perturb:
+            _p = np.random.randn(*data['R'].shape) * self.ZEROTH_ORDER_H
+            data['R'] += _p
+            return data, _p
+        else: 
+            return data
 
     def extensive_data_loader(self, data, device=None):
         batch = {'R': data['R'], 'Z': data['Z']}
@@ -289,50 +228,16 @@ class MLAseCalculator(Calculator):
         return idx
 
 
-# ##-------------------------------------
-# ##     ASE interface for Plumed calculator
-# ##--------------------------------------
-# class PlumedCalculator(Calculator):
-#     implemented_properties = ['energy', 'forces']  # , 'stress'
-#     def __init__(self, ase_plumed, **kwargs):
-#         Calculator.__init__(self, **kwargs)
-#         self.ase_plumed = ase_plumed
-#         self.counter = 0
-#         self.prev_force =None
-#         self.prev_energy = None
-
-#     def calculate(self, atoms=None, properties=['forces'],system_changes=None):
-#         super().calculate(atoms,properties,system_changes)
-#         forces = np.zeros((atoms.get_positions()).shape)
-#         energy = 0
-
-#         model_force = np.copy(forces)
-#         self.counter += 1
-#         # every step() call will call get_forces 2 times, only do plumed once(2nd) to make metadynamics work correctly
-#         # there is one call to get_forces when initialize
-#         # print(self.counter)
-#         # plumed_forces, plumed_energy = self.ase_plumed.external_forces(self.counter , new_forces=forces,
-#         #
-#         #                                                                delta_forces=True)
-#         if self.counter % 2 == 1:
-#             plumed_forces,plumed_energy = self.ase_plumed.external_forces((self.counter + 1) // 2 - 1, new_forces=forces,
-#                                                             new_energy=energy,delta_forces=True)
-#             self.prev_force = plumed_forces
-#             self.prev_energy = plumed_energy
-#             # print('force diff', np.sum(plumed_forces - model_force))
-#         else:
-#             plumed_forces = self.prev_force
-#             plumed_energy = self.prev_energy
-#             # print(self.counter)
-#         # if self.counter % 500 == 0:
-#         #     print('force diff', np.linalg.norm(plumed_forces - model_force))
-
-
-#         # delta energy and forces
-#         if 'energy' in properties:
-#             self.results['energy'] = plumed_energy
-#         if 'forces' in properties:
-#             self.results['forces'] = plumed_forces
-
-# if __name__ == '__main__':
-#     pass
+    def calculate_finite_difference_element_wise(self, j_atom, j_idx, add_shift: bool, atoms=None, properties=['energy', 'forces', 'stress'], system_changes=None):
+        super().calculate(atoms, properties, system_changes)
+        data = self.data_formatter(atoms)
+        data["R"][j_atom, j_idx] += self.ZEROTH_ORDER_H / 2 if add_shift else - self.ZEROTH_ORDER_H / 2
+        data_ = self.extensive_data_loader(data=data, device=self.device[0])
+        pred = self.models[0](data_)
+        self.results['energy'] = pred['E'].squeeze(0).detach().cpu().numpy() * (kcal/mol)
+        if "forces" in properties:
+            self.results['forces'] = pred['F'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang)
+        if "hessian" in properties:
+            self.results['hessian'] = pred['H'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang/Ang)
+        
+        del pred
