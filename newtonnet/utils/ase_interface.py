@@ -1,48 +1,52 @@
+import os
 import numpy as np
-from ase import Atoms
+from ase.units import *
 from ase.calculators.calculator import Calculator
-
 import torch
-from torch_geometric.data import Data, Batch
+import torch.autograd.functional as F
+import yaml
 
-from newtonnet.layers.precision import get_precision_by_string
-from newtonnet.layers.scalers import get_scaler_by_string
-from newtonnet.models.output import get_output_by_string, get_aggregator_by_string
-from newtonnet.models.output import DerivativeProperty, SecondDerivativeProperty
-from newtonnet.data import RadiusGraph
+from newtonnet.layers.activations import get_activation_by_string
+from newtonnet.models import NewtonNet
+from newtonnet.data import ExtensiveEnvironment
+from newtonnet.data import batch_dataset_converter
 
 
 ##-------------------------------------
 ##     ML model ASE interface
 ##--------------------------------------
 class MLAseCalculator(Calculator):
-    implemented_properties = ['energy', 'free_energy', 'forces', 'hessian', 'stress']
-    # note that the free_energy is not the Gibbs/Helmholtz free energy, but the potential energy in the ASE calculator, how confusing
+    implemented_properties = ['energy', 'forces', 'hessian']
 
     ### Constructor ###
-    def __init__(
-            self, 
-            model_path: str,
-            properties: list = ['energy', 'free_energy', 'forces'], 
-            disagreement: str = None,
-            device: str | list[str] = 'cpu',
-            precision: str = 'float32',
-            script: bool = False,
-            trace_n_atoms: int = 0,
-            **kwargs,
-            ):
+    def __init__(self, model_path=None, settings_path=None, hess_method=None, hess_precision=None, disagreement='std', device='cpu', dtype='float', h=1e-3, **kwargs):
         """
-        Constructor for MLAseCalculator for NewtonNet models
+        Constructor for MLAseCalculator
 
-        Parameters:
-            model_path (str): The path to the model.
-            settings_path (str): The path to the settings.
-            properties (list): The properties to be predicted. Default: ['energy', 'free_energy', 'forces'].
-            disagreement (str): The type of disagreement to be calculated. Default: None.
-            device (str): The device for the calculator. Default: 'cpu'.
-            precision (str): The precision of the calculator. Default: 'float32'.
-            script (bool): Whether to script the model. Default: False.
-            trace_n_atoms (int): The number of atoms to be traced. Default: 0.
+        Parameters
+        ----------
+        model_path: str or list of str
+            path to the model. eg. '5k/models/best_model_state.tar'
+        settings_path: str or list of str
+            path to the .yml setting path. eg. '5k/run_scripts/config_h2.yml'
+        hess_method: str
+            method to calculate hessians. 
+            None: do not calculate hessian (default)
+            'autograd': automatic differentiation
+            'fwd_diff': forward difference
+            'cnt_diff': central difference
+        hess_precision: float
+            hessian gradient calculation precision for 'fwd_diff' and 'cnt_diff', ignored otherwise (default: None)
+        disagreement: str
+            method to calculate disagreement between models.
+            'std': standard deviation of all votes (default)
+            'std_outlierremoval': standard deviation with outlier removal
+            'range': range of all votes
+            'values': values of each vote
+            None: do not calculate disagreement
+        device: 
+            device to run model. eg. 'cpu', ['cuda:0', 'cuda:1']
+        kwargs
         """
         Calculator.__init__(self, **kwargs)
 
@@ -50,153 +54,193 @@ class MLAseCalculator(Calculator):
             self.device = [torch.device(item) for item in device]
         else:
             self.device = [torch.device(device)]
-        self.dtype = get_precision_by_string(precision)
 
-        self.models = []
-        self.properties = properties
-        if isinstance(model_path, list):
-            self.models = [self.load_model(model) for model in model_path]
+        self.hess_method = hess_method
+        if self.hess_method == 'autograd':
+            self.return_hessian = True
+        elif self.hess_method == 'fwd_diff' or self.hess_method == 'cnt_diff':
+            raise NotImplementedError
+            self.return_hessian = False
+            self.hess_precision = hess_precision
         else:
-            self.models = [self.load_model(model_path)]
-        
-        self.radius_graph = RadiusGraph(self.models[0].embedding_layer.norm.r)
-        
-        self.script = script
-        self.trace_n_atoms = trace_n_atoms
+            self.return_hessian = False
+
         self.disagreement = disagreement
+
+        # torch.set_default_tensor_type(torch.DoubleTensor)
+        if dtype == 'float':
+            self.dtype = torch.float
+        elif dtype == 'double':
+            self.dtype = torch.double
+        if model_path == None:
+            self.models = [self.load_model(
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "best_model_state.tar"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yml")
+            )]
+            print("model_path is None, using default model path and settings path for Transition1x dataset")
+        elif type(model_path) is list:
+            self.models = [self.load_model(model_path_, settings_path_) for model_path_, settings_path_ in zip(model_path, settings_path)]
+        else:
+            self.models = [self.load_model(model_path, settings_path)]
+
+        self.ZEROTH_ORDER_H = h
+    
+    def add_perturbation(self, data, perturbation):
+        print('='*89)
+        print('len data', len(data))
+    
+        print(data)
+        print('shape of position', data.pos.shape, type(data.pos))
+        mean,std = 0.0,0.1 # mean of the Gaussian noise
+        noise = torch.normal(mean=torch.full(data.pos.shape, mean), 
+                            std=torch.full(data.pos.shape, std))
+
+        # Add the noise to the original tensor
+        data_perturb = data.clone()
+        data_perturb.pos = data.pos + noise
+        print(data)
+        print(data_perturb)
+
+    def calculate(self, atoms=None, properties=['energy','forces','hessian'], system_changes=None, random_perturb=False):
+        super().calculate(atoms,properties,system_changes)
+        if random_perturb:
+            data, _p = self.data_formatter(atoms, random_perturb)
+        else: 
+            data = self.data_formatter(atoms)
+        data_ = self.extensive_data_loader(data=data, device=self.device[0])
+        pred = self.models[0](data_)
+        self.results['energy'] = pred['E'].squeeze(0).detach().cpu().numpy() * (kcal/mol)
+        if "forces" in properties:
+            self.results['forces'] = pred['F'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang)
+        if "hessian" in properties:
+            self.results['hessian'] = pred['H'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang/Ang)
+        if random_perturb:
+            self.results['perturb'] = _p
         
+        del pred
 
-    def calculate(self, atoms=None, properties=['energy', 'forces', 'stress'], system_changes=None):
-        super().calculate(atoms, self.properties, system_changes)
-        if isinstance(atoms, Atoms):
-            atoms = [atoms]
-        data = self.format_data(atoms)
-        n_models, n_frames, n_atoms = len(self.models), len(atoms), len(atoms[0])
+    def load_model(self, model_path, settings_path):
+        settings = yaml.safe_load(open(settings_path, "r"))
+        activation = get_activation_by_string(settings['model']['activation'])
+        model = NewtonNet(resolution=settings['model']['resolution'],
+                            n_features=settings['model']['n_features'],
+                            activation=activation,
+                            n_interactions=settings['model']['n_interactions'],
+                            dropout=settings['training']['dropout'],
+                            max_z=10,
+                            cutoff=settings['data']['cutoff'],  ## data cutoff
+                            cutoff_network=settings['model']['cutoff_network'],
+                            normalize_atomic=settings['model']['normalize_atomic'],
+                            requires_dr=settings['model']['requires_dr'],
+                            device=self.device[0],
+                            create_graph=False,
+                            shared_interactions=settings['model']['shared_interactions'],
+                            return_hessian=self.return_hessian,
+                            double_update_latent=settings['model']['double_update_latent'],
+                            layer_norm=settings['model']['layer_norm'],
+                            )
 
-        preds = {}
-        if 'energy' in self.properties:
-            preds['energy'] = np.zeros((n_models, n_frames))
-        if 'free_energy' in self.properties:
-            preds['free_energy'] = np.zeros((n_models, n_frames))
-        if 'forces' in self.properties:
-            preds['forces'] = np.zeros((n_models, n_frames, n_atoms, 3))
-        if 'hessian' in self.properties:
-            preds['hessian'] = np.zeros((n_models, n_frames, n_atoms, 3, n_atoms, 3))
-        if 'stress' in self.properties:
-            preds['stress'] = np.zeros((n_models, n_frames, 6))
-        for model_, model in enumerate(self.models):
-            pred = model(data.z, data.disp, data.edge_index, data.batch)
-            if 'energy' in self.properties:
-                energy = pred.energy.cpu().detach().numpy()
-                preds['energy'][model_] = energy
-            if 'free_energy' in self.properties:
-                energy = pred.energy.cpu().detach().numpy()
-                preds['free_energy'][model_] = energy
-            if 'forces' in self.properties:
-                force = pred.gradient_force.cpu().detach().numpy()
-                preds['forces'][model_] = force.reshape(n_frames, n_atoms, 3)
-            if 'hessian' in self.properties:
-                hessian = pred.hessian.cpu().detach().numpy()
-                preds['hessian'][model_] = hessian.reshape(n_frames, n_atoms, 3, n_atoms, 3)
-            if 'stress' in self.properties:
-                virial = pred.virial.cpu().detach().numpy()
-                volume = np.array([atoms[frame].get_volume() for frame in range(n_frames)])
-                stress = -virial[:, [0, 1, 2, 1, 0, 0], [0, 1, 2, 2, 2, 1]] / volume[:, None] / 2
-                preds['stress'][model_] = stress
-            del pred
-
-        # self.results['outlier'] = self.q_test(preds['energy'])
-        for key in self.properties:
-            # self.results[key] = self.remove_outlier(preds[key], self.results['outlier']).mean(axis=0)
-            self.results[key] = preds[key].mean(axis=0).squeeze()
-
-            # if self.disagreement == 'std':
-            #     self.results[key + '_disagreement'] = preds[key].std(axis=0).max()
-            # elif self.disagreement == 'std_outlierremoval':
-            #     self.results[key + '_disagreement'] = self.remove_outlier(preds[key], self.results['outlier']).std(axis=0).max()
-            # elif self.disagreement == 'range':
-            #     self.results[key + '_disagreement'] = (preds[key].max(axis=0) - preds[key].min(axis=0)).max()
-            # elif self.disagreement == 'values':
-            #     self.results[key + '_disagreement'] = preds[key]
-            del preds[key]
-
-    def load_model(self, model):
-        # TODO: Load model with only weights
-        model = torch.load(model, map_location=self.device[0], weights_only=False)
-        keys_to_keep = ['energy']
-        for key in self.properties:
-            key = {
-                'energy': 'energy',
-                'free_energy': 'energy',
-                'forces': 'gradient_force',
-                'stress': 'virial',
-                'hessian': 'hessian',
-            }.get(key)
-            keys_to_keep.append(key)
-            if key in model.infer_properties:
-                continue
-            model.infer_properties.append(key)
-            model.output_layers.append(get_output_by_string(key))
-            model.scalers.append(get_scaler_by_string(key))
-            model.aggregators.append(get_aggregator_by_string(key))
-        ids_to_remove = [i for i, key in enumerate(model.infer_properties) if key not in keys_to_keep]
-        for i in reversed(ids_to_remove):
-            model.infer_properties.pop(i)
-            model.output_layers.pop(i)
-            model.scalers.pop(i)
-            model.aggregators.pop(i)
+        model.load_state_dict(torch.load(model_path, map_location=self.device[0])['model_state_dict'], )
+        model = model
+        model.to(self.device[0])
         model.to(self.dtype)
         model.eval()
-        model.embedding_layer.requires_dr = any(isinstance(layer, DerivativeProperty) for layer in model.output_layers)
-        if any(isinstance(layer, SecondDerivativeProperty) for layer in model.output_layers):
-            for layer in model.output_layers:
-                if isinstance(layer, DerivativeProperty):
-                    layer.create_graph = True
         return model
-
-    def format_data(self, atoms_list):
-        data_list = []
-        for atoms in atoms_list:
-            z = torch.tensor(atoms.get_atomic_numbers(), dtype=torch.long, device=self.device[0])
-            pos = torch.tensor(atoms.get_positions(wrap=True), dtype=self.dtype, device=self.device[0])
-            lattice = torch.tensor(atoms.get_cell().array, dtype=self.dtype, device=self.device[0])
-            lattice[~atoms.get_pbc()] = torch.inf
-            data = Data(pos=pos, z=z, lattice=lattice)
-            data = self.radius_graph(data)
-            data_list.append(data)
-        batch = Batch.from_data_list(data_list)
-        return batch
-
-    # def remove_outlier(self, data, idx):
-    #     if idx is None:
-    #         return data
-    #     else:
-    #         return np.delete(data, idx, axis=0)
-
-    # def q_test(self, data):
-    #     '''
-    #     Dixon's Q test for outlier detection
-
-    #     Parameters:
-    #         data (1d array): The data to be tested.
-
-    #     Returns:
-    #         idx (int): The index to be filtered out.
-    #     '''
-    #     idx = np.full_like(data, np.nan)
-    #     if len(data) >= 3:
-    #         q_ref = { 3: 0.970,  4: 0.829,  5: 0.710, 
-    #                   6: 0.625,  7: 0.568,  8: 0.526,  9: 0.493, 10: 0.466, 
-    #                  11: 0.444, 12: 0.426, 13: 0.410, 14: 0.396, 15: 0.384, 
-    #                  16: 0.374, 17: 0.365, 18: 0.356, 19: 0.349, 20: 0.342, 
-    #                  21: 0.337, 22: 0.331, 23: 0.326, 24: 0.321, 25: 0.317, 
-    #                  26: 0.312, 27: 0.308, 28: 0.305, 29: 0.301, 30: 0.290}.get(len(self.models))  # 95% confidence interval
-    #         sorted_data = np.sort(data, axis=0)
-    #         q_stat_min = (sorted_data[1] - sorted_data[0]) / (sorted_data[-1] - sorted_data[0])
-    #         q_stat_max = (sorted_data[-1] - sorted_data[-2]) / (sorted_data[-1] - sorted_data[0])
-    #         min_mask = q_stat_min > q_ref
-    #         max_mask = q_stat_max > q_ref
-    #         idx[min_mask] = np.argmin(data[:, min_mask], axis=0)
-    #         idx[max_mask] = np.argmax(data[:, max_mask], axis=0)
-    #     return idx
     
+
+    def data_formatter(self, atoms, random_perturb = False):
+        """
+        convert ase.Atoms to input format of the model
+
+        Parameters
+        ----------
+        atoms: ase.Atoms
+
+        Returns
+        -------
+        data: dict
+            dictionary of arrays with following keys:
+                - 'R':positions
+                - 'Z':atomic_numbers
+                - 'E':energy
+                - 'F':forces
+        """
+        data  = {
+            'R': np.array(atoms.get_positions())[np.newaxis, ...], #shape(ndata,natoms,3)
+            'Z': np.array(atoms.get_atomic_numbers())[np.newaxis, ...], #shape(ndata,natoms)
+            'E': np.zeros((1,1)), #shape(ndata,1)
+            'F': np.zeros((1,len(atoms.get_atomic_numbers()), 3)),#shape(ndata,natoms,3)
+        }
+        if random_perturb:
+            _p = np.random.randn(*data['R'].shape) * self.ZEROTH_ORDER_H
+            data['R'] += _p
+            return data, _p
+        else: 
+            return data
+
+    def extensive_data_loader(self, data, device=None):
+        batch = {'R': data['R'], 'Z': data['Z']}
+        N, NM, AM, _, _ = ExtensiveEnvironment().get_environment(data['R'], data['Z'])
+        batch.update({'N': N, 'NM': NM, 'AM': AM})
+        batch = batch_dataset_converter(batch, device=device)
+        batch['R'] = batch['R'].to(self.dtype)
+        return batch
+    
+
+    def remove_outlier(self, data, idx):
+        if idx is None:
+            return data
+        else:
+            return np.delete(data, idx, axis=0)
+
+
+    def q_test(self, data):
+        """
+        Dixon's Q test for outlier detection
+
+        Parameters
+        ----------
+        data: 1d array with shape (nlearners,)
+
+        Returns
+        -------
+        idx: int or None
+            the index to be filtered out (return only one index for now as the default is only 4 learners)
+        """
+        if len(data) < 3:
+            idx = None
+        else:
+            q_ref = { 3: 0.970,  4: 0.829,  5: 0.710, 
+                      6: 0.625,  7: 0.568,  8: 0.526,  9: 0.493, 10: 0.466, 
+                     11: 0.444, 12: 0.426, 13: 0.410, 14: 0.396, 15: 0.384, 
+                     16: 0.374, 17: 0.365, 18: 0.356, 19: 0.349, 20: 0.342, 
+                     21: 0.337, 22: 0.331, 23: 0.326, 24: 0.321, 25: 0.317, 
+                     26: 0.312, 27: 0.308, 28: 0.305, 29: 0.301, 30: 0.290}.get(len(self.models))  # 95% confidence interval
+            sorted_data = np.sort(data, axis=0)
+            q_stat_min = (sorted_data[1] - sorted_data[0]) / (sorted_data[-1] - sorted_data[0])
+            q_stat_max = (sorted_data[-1] - sorted_data[-2]) / (sorted_data[-1] - sorted_data[0])
+            if q_stat_min > q_ref:
+                idx = np.argmin(data)
+            elif q_stat_max > q_ref:
+                idx = np.argmax(data)
+            else:
+                idx = None
+        return idx
+
+
+    def calculate_finite_difference_element_wise(self, j_atom, j_idx, add_shift: bool, atoms=None, properties=['energy', 'forces', 'stress'], system_changes=None):
+        super().calculate(atoms, properties, system_changes)
+        pos = atoms.get_positions(wrap=True)
+        pos[j_atom, j_idx] += self.ZEROTH_ORDER_H / 2 if add_shift else - self.ZEROTH_ORDER_H / 2
+        atoms.set_positions(pos)
+        data = self.data_formatter(atoms)
+
+        data_ = self.extensive_data_loader(data=data, device=self.device[0])
+        pred = self.models[0](data_)
+        self.results['energy'] = pred['E'].squeeze(0).detach().cpu().numpy() * (kcal/mol)
+        if "forces" in properties:
+            self.results['forces'] = pred['F'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang)
+        if "hessian" in properties:
+            self.results['hessian'] = pred['H'].squeeze(0).detach().cpu().numpy() * (kcal/mol/Ang/Ang)
+        
+        del pred
